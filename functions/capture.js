@@ -93,24 +93,31 @@ async function fetchTO(url, opts={}, ms=60000){
 }
 
 // Cloudinary signed upload (HMAC-SHA1)
-async function uploadCloudinarySigned(blob, publicId) {
-  const ts = Math.floor(Date.now()/1000);
-  const param = `public_id=${publicId}&timestamp=${ts}`;
-  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(CLOUDINARY_API_SECRET), {name:"HMAC",hash:"SHA-1"}, false, ["sign"]);
-  const sigBuf = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(param));
-  const signature = Array.from(new Uint8Array(sigBuf)).map(b=>b.toString(16).padStart(2,"0")).join("");
+async function uploadCloudinarySigned(fileBlob, publicId) {
+  const ts = Math.floor(Date.now() / 1000);
 
+  // 1) string_to_sign: các tham số (không rỗng) theo thứ tự alpha & nối bằng '&'
+  // Ở đây ta chỉ dùng: public_id, timestamp
+  const paramString = `public_id=${publicId}&timestamp=${ts}`;
+
+  // 2) signature = SHA1(paramString + API_SECRET)  <-- KHÔNG dùng HMAC
+  const enc = new TextEncoder();
+  const data = enc.encode(paramString + CLOUDINARY_API_SECRET);
+  const digest = await crypto.subtle.digest("SHA-1", data);
+  const signature = Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, "0")).join("");
+
+  // 3) POST lên Cloudinary
   const endpoint = `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/image/upload`;
   const form = new FormData();
-  form.append("file", blob, `${publicId}.png`);
-  form.append("public_id", publicId);
+  form.append("file", fileBlob, `${publicId}.png`);
+  form.append("public_id", publicId);         // nếu muốn vào folder, đặt public_id = "tradingview/..."
   form.append("api_key", CLOUDINARY_API_KEY);
   form.append("timestamp", String(ts));
   form.append("signature", signature);
 
-  const r = await fetch(endpoint, { method:"POST", body: form });
-  if (!r.ok) throw new Error(`Cloudinary upload failed: ${r.status} ${await r.text()}`);
-  return await r.json();
+  const resp = await fetch(endpoint, { method: "POST", body: form });
+  if (!resp.ok) throw new Error(`Cloudinary upload failed: ${resp.status} ${await resp.text()}`);
+  return await resp.json();
 }
 
 export const onRequestGet = async ({ request }) => {
