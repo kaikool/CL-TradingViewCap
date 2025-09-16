@@ -81,6 +81,7 @@ export default async function ({ page, context }) {
   for(let i=0;i<50;i++){try{await page.keyboard.press("ArrowRight");}catch{} await new Promise(r=>setTimeout(r,10));}
   try{const el=await findChartContainer(); const box=el&&await el.boundingBox(); if(box){await page.mouse.move(box.x+box.width+8,box.y+8);} else {await page.mouse.move(0,0);} }catch{}
   const buf=(await screenshotChartRegion())||await page.screenshot({type:"png",fullPage:true});
+  // Trả về binary PNG để /function có thể trả trực tiếp hoặc bọc JSON tùy cấu hình
   return { data: buf, type: "image/png" };
 }
   `.trim();
@@ -115,7 +116,7 @@ async function uploadCloudinarySigned(blob, publicId) {
 export const onRequestGet = async ({ request }) => {
   const url = new URL(request.url);
 
-  // Không có query => trả health (như bạn yêu cầu)
+  // Không có query => health
   if ([...url.searchParams.keys()].length === 0) {
     return J({ ok: true, time: new Date().toISOString() });
   }
@@ -143,15 +144,55 @@ export const onRequestGet = async ({ request }) => {
     return J({ ok:false, error: t || `Upstream error ${r.status}` }, 502);
   }
 
+  // ---- XỬ LÝ CẢ 2 KIỂU PHẢN HỒI: binary PNG hoặc JSON bọc Buffer/base64 ----
   const ct = (r.headers.get("content-type")||"").toLowerCase();
-  if (!(ct.includes("image/png") || ct.includes("application/octet-stream"))) {
+
+  let pngArrayBuffer;
+
+  if (ct.includes("image/png") || ct.includes("application/octet-stream")) {
+    // Upstream trả nhị phân trực tiếp
+    pngArrayBuffer = await r.arrayBuffer();
+
+  } else if (ct.includes("application/json")) {
+    const text = await r.text();
+    if (isRateLimitErrorMessage(text)) return rateLimited(text);
+
+    let obj;
+    try { obj = JSON.parse(text); }
+    catch { return J({ ok:false, error:"Upstream JSON parse failed", detail: text.slice(0,400) }, 502); }
+
+    // Các biến thể phổ biến:
+    // 1) { data: { type:"Buffer", data:[...bytes] }, type:"image/png" }
+    // 2) { data: "<base64>", type:"image/png", encoding:"base64" }
+    // 3) { body: { data:{type:"Buffer", data:[...]}, ... } }
+    let bytes = null;
+
+    if (obj?.data?.type === "Buffer" && Array.isArray(obj?.data?.data)) {
+      bytes = new Uint8Array(obj.data.data);
+    } else if (typeof obj?.data === "string" && (obj?.encoding === "base64" || /^[A-Za-z0-9+/=]+$/.test(obj.data))) {
+      // decode base64 -> Uint8Array
+      const b64 = obj.data;
+      const bin = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+      bytes = bin;
+    } else if (obj?.body?.data?.type === "Buffer" && Array.isArray(obj?.body?.data?.data)) {
+      bytes = new Uint8Array(obj.body.data.data);
+    }
+
+    if (!bytes) {
+      return J({ ok:false, error:"Unsupported upstream JSON shape", sample: Object.keys(obj).slice(0,6) }, 502);
+    }
+
+    pngArrayBuffer = bytes.buffer;
+
+  } else {
+    // Content-Type lạ → trả về để debug
     const t = await r.text();
     if (isRateLimitErrorMessage(t)) return rateLimited(t);
-    return J({ ok:false, error:"Unexpected upstream content-type", detail:t }, 502);
+    return J({ ok:false, error:"Unexpected upstream content-type", detail: t.slice(0,400) }, 502);
   }
 
-  const ab = await r.arrayBuffer();
-  const blob = new Blob([ab], { type:"image/png" });
+  // ---- Upload Cloudinary ----
+  const blob = new Blob([pngArrayBuffer], { type:"image/png" });
   const publicId = fmtName(ticker, tf, "Asia/Bangkok");
 
   let up;
